@@ -1,0 +1,334 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Serial-by-ref: two merges must not race the Argo reconciliation.
+concurrency:
+  group: physician-directory-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SERVICE_SLUG: physician-directory
+  NAMESPACE: physician-directory-prod
+  INFISICAL_PATH: /physician-directory
+  ARGO_APP: cluster-physician-directory
+
+jobs:
+  deploy-prod:
+    if: github.ref == 'refs/heads/main'
+    runs-on: zennya-dev-runners
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # In-cluster runner SA auth (ZO-61444 pattern): the runner pod's
+      # mounted ServiceAccount is used for namespaced kubectl (harbor-secret
+      # + physician-directory-secrets materialisation). Namespace creation
+      # stays admin-applied out-of-band.
+      - name: Configure in-cluster kubeconfig (runner SA)
+        run: |
+          sa=/var/run/secrets/kubernetes.io/serviceaccount
+          kubectl config set-cluster incluster \
+            --server="https://${KUBERNETES_SERVICE_HOST}:${KUBERNETES_SERVICE_PORT}" \
+            --certificate-authority="$sa/ca.crt" --embed-certs=true
+          kubectl config set-credentials runner-sa --token="$(cat "$sa/token")"
+          kubectl config set-context incluster --cluster=incluster --user=runner-sa
+          kubectl config use-context incluster
+
+      - name: Check cluster connectivity (namespaced)
+        run: kubectl get deployments -n physician-directory-prod -o name --request-timeout=30s
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate required secrets
+        env:
+          HARBOR_REGISTRY_URL: ${{ secrets.HARBOR_REGISTRY_URL }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+        run: |
+          missing=()
+          [[ -z "$HARBOR_REGISTRY_URL" ]] && missing+=("HARBOR_REGISTRY_URL")
+          [[ -z "$HARBOR_USERNAME" ]] && missing+=("HARBOR_USERNAME")
+          [[ -z "$HARBOR_PASSWORD" ]] && missing+=("HARBOR_PASSWORD")
+          [[ -z "$INFISICAL_CLIENT_ID" ]] && missing+=("INFISICAL_CLIENT_ID")
+          [[ -z "$INFISICAL_CLIENT_SECRET" ]] && missing+=("INFISICAL_CLIENT_SECRET")
+          [[ -z "$INFISICAL_PROJECT_ID" ]] && missing+=("INFISICAL_PROJECT_ID")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "Missing required secrets: ${missing[*]}"
+            exit 1
+          fi
+
+      - name: Install Infisical CLI
+        run: |
+          curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
+          sudo apt-get update && sudo apt-get install -y infisical
+
+      - name: Run tests
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+          python -m pytest
+
+      - name: "Set up Buildx (driver: remote -> in-cluster BuildKit)"
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: tcp://buildkit.arc-runners.svc.cluster.local:1234
+
+      - name: Log in to Harbor
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          HARBOR_REGISTRY_URL: ${{ secrets.HARBOR_REGISTRY_URL }}
+        run: echo "$HARBOR_PASSWORD" | docker login "https://$HARBOR_REGISTRY_URL" -u "$HARBOR_USERNAME" --password-stdin
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.HARBOR_REGISTRY_URL }}/zennya/physician-directory:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.HARBOR_REGISTRY_URL }}/zennya/physician-directory:cache
+          cache-to: type=registry,ref=${{ secrets.HARBOR_REGISTRY_URL }}/zennya/physician-directory:cache,mode=max,image-manifest=true,ignore-error=true
+
+      # The CNPG Cluster CR (cluster/postgres/physician-directory) declares
+      # imagePullSecrets harbor-secret in this namespace; the app Deployment
+      # pulls with the same secret. Materialised here from org secrets —
+      # values never transit chat or diffs.
+      - name: Sync Harbor image-pull secret
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+          HARBOR_REGISTRY_URL: ${{ secrets.HARBOR_REGISTRY_URL }}
+        run: |
+          kubectl create secret docker-registry harbor-secret \
+            --docker-server="https://$HARBOR_REGISTRY_URL" \
+            --docker-username="$HARBOR_USERNAME" \
+            --docker-password="$HARBOR_PASSWORD" \
+            --namespace=physician-directory-prod \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Export app secrets from Infisical (/physician-directory env=prod) and
+      # materialise physician-directory-secrets. Values flow Infisical ->
+      # kubectl entirely in-runner; they never appear in chat, diffs, or logs.
+      # ZO-80721 GUARD: refuse placeholder values so a known-bad credential can
+      # never reach the cluster.
+      - name: Export app secrets from Infisical (/physician-directory env=prod)
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          INFISICAL_TOKEN=$(infisical login \
+            --method=universal-auth \
+            --client-id="$INFISICAL_CLIENT_ID" \
+            --client-secret="$INFISICAL_CLIENT_SECRET" \
+            --domain=https://infisical.zennya.app \
+            --plain --silent)
+          get() { infisical secrets get "$1" --token="$INFISICAL_TOKEN" \
+            --domain=https://infisical.zennya.app \
+            --projectId="$INFISICAL_PROJECT_ID" \
+            --env=prod --path=/physician-directory --plain; }
+          ROLE_PASSWORD=$(get PHYSICIAN_DIRECTORY_ROLE_PASSWORD)
+          INTERNAL_KEY=$(get MEDICAL_INTERNAL_API_KEY)
+          [[ "$ROLE_PASSWORD" == PLACEHOLDER* ]] && { echo "::error::PHYSICIAN_DIRECTORY_ROLE_PASSWORD is still a placeholder (ZO-80721). Aborting."; exit 1; }
+          [[ "$INTERNAL_KEY" == PLACEHOLDER* ]] && { echo "::error::MEDICAL_INTERNAL_API_KEY is still a placeholder (ZO-80721). Aborting."; exit 1; }
+          echo "::add-mask::$ROLE_PASSWORD"
+          echo "::add-mask::$INTERNAL_KEY"
+          DATABASE_URL="postgresql+psycopg://physician_directory:${ROLE_PASSWORD}@physician-directory-db-ha-rw:5432/physician_directory"
+          kubectl create secret generic physician-directory-secrets \
+            --namespace=physician-directory-prod \
+            --from-literal=DATABASE_URL="$DATABASE_URL" \
+            --from-literal=MEDICAL_INTERNAL_API_KEY="$INTERNAL_KEY" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          # The CNPG bootstrap Secret pins the initdb owner password to the
+          # SAME Infisical-held value, so Infisical stays the source of truth.
+          kubectl create secret generic physician-directory-db-ha-bootstrap \
+            --namespace=physician-directory-prod \
+            --from-literal=username="physician_directory" \
+            --from-literal=password="$ROLE_PASSWORD" \
+            --type=kubernetes.io/basic-auth \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Verify service is live (in-cluster)
+        run: |
+          set -euo pipefail
+          for i in 1 2 3 4 5; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' \
+              --max-time 10 \
+              http://physician-api.physician-directory-prod.svc.cluster.local:8135/health || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "Prod /health returned 200 from inside the cluster"
+              exit 0
+            fi
+            echo "Attempt $i: /health returned $code; retrying..."
+            sleep 5
+          done
+          echo "::warning::In-cluster /health did not return 200 (expected on the very first run before Argo syncs). Continuing to the pin PR."
+
+  # ZO-62876 pattern: open a pin-bump PR in zennya-infra after successful
+  # image builds on main. Auto-merge is armed (ZO-57304); the workflow then
+  # syncs cluster-physician-directory via the Argo API and waits for
+  # Synced+Healthy (ZO-64093).
+  open-release-pr:
+    name: Open zennya-infra pin-bump PR
+    runs-on: zennya-dev-runners
+    needs: deploy-prod
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 15
+    steps:
+      - name: Install Infisical CLI + jq
+        run: |
+          curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | sudo -E bash
+          sudo apt-get update && sudo apt-get install -y infisical jq
+
+      - name: Mint zennya-dev-automation installation token
+        id: app-token
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          INFISICAL_TOKEN=$(infisical login \
+            --method=universal-auth \
+            --client-id="$INFISICAL_CLIENT_ID" \
+            --client-secret="$INFISICAL_CLIENT_SECRET" \
+            --domain=https://infisical.zennya.app \
+            --plain --silent)
+          get() { infisical secrets get "$1" --token="$INFISICAL_TOKEN" \
+            --domain=https://infisical.zennya.app \
+            --projectId="$INFISICAL_PROJECT_ID" \
+            --env=prod --path=/argocd --plain; }
+          APP_ID=$(get ARGOCD_REPO_GITHUB_APP_ID)
+          INSTALL_ID=$(get ARGOCD_REPO_GITHUB_APP_INSTALLATION_ID)
+          PEM=$(get ARGOCD_REPO_GITHUB_APP_PRIVATE_KEY_PEM)
+          echo "::add-mask::$PEM"
+          [[ "$APP_ID" =~ ^[0-9]+$ ]] && [[ "$PEM" =~ ^-----BEGIN ]] || { echo "::error::bad App creds from Infisical"; exit 1; }
+          NOW=$(date +%s)
+          HEADER=$(printf '{"alg":"RS256","typ":"JWT"}' | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          PAYLOAD=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((NOW-60))" "$((NOW+540))" "$APP_ID" | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          SIG=$(printf '%s.%s' "$HEADER.$PAYLOAD" | openssl dgst -sha256 -sign <(printf '%s\n' "$PEM") | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+          JWT="$HEADER.$PAYLOAD.$SIG"
+          INSTALL_TOKEN=$(curl -sf -X POST \
+            -H "Authorization: Bearer $JWT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations/$INSTALL_ID/access_tokens" | jq -r '.token')
+          [ -n "$INSTALL_TOKEN" ] && [ "$INSTALL_TOKEN" != "null" ] || { echo "::error::installation token mint failed"; exit 1; }
+          echo "::add-mask::$INSTALL_TOKEN"
+          echo "token=$INSTALL_TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Open pin-bump PR
+        id: open-pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NEW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT="${NEW_SHA:0:8}"
+          git clone --depth 1 "https://x-access-token:${GH_TOKEN}@github.com/zennya-dev/zennya-infra.git" infra
+          cd infra
+          D="cluster/physician-directory/02-deployment.yaml"
+          OLD=$(grep -oE 'zennya/physician-directory:[a-f0-9]{40}' "$D" | head -1 | sed 's/.*://')
+          [ -n "$OLD" ] || { echo "::error::could not detect current pin in $D"; exit 1; }
+          if [ "$OLD" = "$NEW_SHA" ]; then echo "pin already at $SHORT"; exit 0; fi
+          N=$(grep -c "zennya/physician-directory:$OLD" "$D")
+          [ "$N" -eq 2 ] || { echo "::error::expected exactly 2 occurrence(s) of zennya/physician-directory:$OLD in $D, found $N"; exit 1; }
+          sed -i "s|zennya/physician-directory:$OLD|zennya/physician-directory:$NEW_SHA|g" "$D"
+          [ "$(grep -c "zennya/physician-directory:$NEW_SHA" "$D")" -eq 2 ] || { echo "::error::post-sed sanity failed"; exit 1; }
+          git config user.name "zennya-dev-automation[bot]"
+          git config user.email "zennya-dev-automation[bot]@users.noreply.github.com"
+          BRANCH="release/physician-directory-$SHORT"
+          git checkout -b "$BRANCH"
+          git commit -am "release(physician-directory): $SHORT — bump pin(s) to $NEW_SHA"
+          git push -f origin "$BRANCH"
+          PR_URL=$(gh pr create --repo zennya-dev/zennya-infra --base main --head "$BRANCH" \
+            --title "release(physician-directory): $SHORT" \
+            --body "Automated pin bump from physician-directory@$NEW_SHA (run ${{ github.run_id }})." \
+            2>/dev/null || true)
+          if [ -z "$PR_URL" ]; then
+            echo "PR may already exist for $BRANCH — looking up existing PR number"
+            PR_URL=$(gh pr list --repo zennya-dev/zennya-infra --head "$BRANCH" --json url -q '.[0].url // empty')
+          fi
+          [ -n "$PR_URL" ] || { echo "::error::could not obtain PR URL for $BRANCH"; exit 1; }
+          PR_NUMBER="${PR_URL##*/}"
+          echo "Pin PR #$PR_NUMBER opened at $PR_URL"
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+
+      - name: "ZO-57304: arm auto-merge on the pin PR"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.open-pr.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          [ -n "$PR_NUMBER" ] || { echo "::error::no PR number from prior step"; exit 1; }
+          set +e
+          gh pr merge "$PR_NUMBER" --repo zennya-dev/zennya-infra --auto --merge --delete-branch 2>/dev/null
+          RC_MERGE=$?
+          gh pr merge "$PR_NUMBER" --repo zennya-dev/zennya-infra --auto --squash --delete-branch 2>/dev/null
+          RC_SQUASH=$?
+          set -e
+          if [ $RC_MERGE -ne 0 ] && [ $RC_SQUASH -ne 0 ]; then
+            echo "::error::gh pr merge --auto failed (merge=$RC_MERGE squash=$RC_SQUASH). Operator must merge PR #$PR_NUMBER manually."
+            exit 1
+          fi
+          echo "Auto-merge armed on PR #$PR_NUMBER (merge=$RC_MERGE squash=$RC_SQUASH)"
+
+      # ZO-64093 — sync cluster-physician-directory after the pin PR
+      # auto-merges; wait Synced+Healthy (max 10m). ZO-79387 layer-5 fix
+      # BAKED IN: Argo CD has NO POST /api/v1/applications/{app}/refresh
+      # route (server/application/application.proto); the documented refresh
+      # trigger is GET ?refresh=normal (ApplicationQuery.refresh). The
+      # parent medical-service workflow's broken POST /refresh 415 is NOT
+      # reproduced here.
+      - name: "ZO-64093: sync cluster-physician-directory and wait Synced+Healthy"
+        run: |
+          set -euo pipefail
+          ARGOCD_URL="https://argocd-server.argocd.svc.cluster.local:443"
+          APP=cluster-physician-directory
+          SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+          TOKEN="$(cat "$SA_DIR/token")"
+          curl --fail --silent --show-error --max-time 60 --insecure \
+            --header "Authorization: Bearer $TOKEN" \
+            "$ARGOCD_URL/api/v1/applications/$APP?refresh=normal" \
+            -o /dev/null -w "  refresh HTTP %{http_code}\n"
+          curl --fail --silent --show-error --max-time 600 --insecure \
+            --header "Authorization: Bearer $TOKEN" \
+            --header "Content-Type: application/json" \
+            --request POST "$ARGOCD_URL/api/v1/applications/$APP/sync" \
+            -d '{"prune":false,"retry":{"limit":5,"duration":"10m"}}' \
+            -o /dev/null -w "  sync   HTTP %{http_code}\n"
+          DEADLINE=$(( $(date +%s) + 600 ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            STATUS=$(curl --fail --silent --show-error --max-time 30 --insecure \
+                      --header "Authorization: Bearer $TOKEN" \
+                      "$ARGOCD_URL/api/v1/applications/$APP?fields=status" || true)
+            HEALTH=$(echo "$STATUS" | jq -r '.status.health.status // "Unknown"' 2>/dev/null || echo "Unknown")
+            SYNC=$(echo "$STATUS" | jq -r '.status.sync.status // "Unknown"' 2>/dev/null || echo "Unknown")
+            echo "  Argo $APP: health=$HEALTH sync=$SYNC"
+            if [ "$HEALTH" = "Healthy" ] && [ "$SYNC" = "Synced" ]; then
+              echo "### Argo $APP: Synced + Healthy" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$HEALTH" = "Degraded" ]; then
+              echo "::error::Argo $APP reports health=Degraded after pin merge."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::Argo $APP did not reach Synced+Healthy within 10m (last: health=$HEALTH sync=$SYNC)."
+          exit 1
