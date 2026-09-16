@@ -1,0 +1,158 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Concurrency: serial-by-ref so two merges can't race the same Argo app
+# reconciliation (ZO-64093). New runs cancel in-progress for the same SHA.
+concurrency:
+  group: physician-directory-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: zennya-dev-runners
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # ----- Build + push to Harbor -----
+      - name: Login to Harbor
+        env:
+          HARBOR_REGISTRY_URL: ${{ secrets.HARBOR_REGISTRY_URL }}
+          HARBOR_USERNAME:    ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD:    ${{ secrets.HARBOR_PASSWORD }}
+        run: echo "${HARBOR_PASSWORD}" | docker login -u "${HARBOR_USERNAME}" --password-stdin "${HARBOR_REGISTRY_URL}"
+
+      - name: Build + push image
+        env:
+          HARBOR_REGISTRY_URL: ${{ secrets.HARBOR_REGISTRY_URL }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          IMAGE="${HARBOR_REGISTRY_URL}/zennya/physician-directory:${SHORT_SHA}"
+          docker build -t "${IMAGE}" .
+          docker push "${IMAGE}"
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+      # ----- Open the zennya-infra pin-bump PR -----
+      - name: Open zennya-infra pin-bump PR
+        env:
+          ZENNYA_INFRA_TOKEN:  ${{ secrets.ZENNYA_INFRA_PR_TOKEN }}
+          IMAGE:               ${{ env.IMAGE }}
+          SHORT_SHA:           ${{ github.sha }}
+          BRANCH:              "release/physician-directory-${SHORT_SHA}"
+          PR_TARGET_BRANCH:    "main"
+          PR_TITLE:            "release(physician-directory): ${SHORT_SHA}"
+          PR_BODY:             "Pin bump for physician-directory image ${IMAGE}. Auto-opened by the Deploy workflow."
+          RC_MERGE:            "merge"
+          RC_SQUASH:           "false"
+          ZO_64093:            "cluster-physician-directory"
+          ARGOCD_URL:          "https://argocd-server.argocd.svc.cluster.local:443"
+          APP:                 "cluster-physician-directory"
+          SA_DIR:              "/var/run/secrets/kubernetes.io/serviceaccount"
+        run: |
+          set -euo pipefail
+          TOKEN="$(cat "${SA_DIR}/token")"
+
+          git remote add zennya-infra "https://x-access-token:${ZENNYA_INFRA_TOKEN}@github.com/zennya-dev/zennya-infra.git"
+          git -c user.email=ci@zennya.com -c user.name="zennya-deploy" fetch zennya-infra "${PR_TARGET_BRANCH}"
+          git checkout -b "${BRANCH}" "zennya-infra/${PR_TARGET_BRANCH}"
+
+          # Find the deployment under cluster/physician-directory/ and pin the
+          # medical-api → physician-api container's image. INIT container
+          # images (run-migrations) get pinned too so migrate runs against
+          # the matching alembic head.
+          for f in cluster/physician-directory/*.yaml cluster/physician-directory/**/*.yaml; do
+            [ -f "$f" ] || continue
+            if grep -q "physician-api" "$f"; then
+              sed -i.bak -E "s|(physician-api:[a-f0-9]{40})|physician-api:${SHORT_SHA}|g" "$f"
+            fi
+            if grep -q "run-migrations" "$f"; then
+              sed -i.bak -E "s|(run-migrations:[a-f0-9]{40})|run-migrations:${SHORT_SHA}|g" "$f"
+            fi
+          done
+
+          # The physician-api `image:` line's prefix (zennya/physician-directory
+          # vs the previous service) is set in the cluster/physician-directory
+          # manifest; pin the short-sha tag onto whatever prefix the manifest
+          # already declares.
+          for f in cluster/physician-directory/*.yaml cluster/physician-directory/**/*.yaml; do
+            [ -f "$f" ] || continue
+            grep -qE "image:\s.*/physician-directory:[a-f0-9]{40}" "$f" \
+              && sed -i.bak -E "s|physician-directory:[a-f0-9]{40}|physician-directory:${SHORT_SHA}|g" "$f"
+          done
+          rm -f cluster/physician-directory/**/*.bak cluster/physician-directory/*.bak
+
+          git add cluster/physician-directory
+          if git diff --cached --quiet; then
+            echo "No changes to pin — image already matches."
+          else
+            git -c user.email=ci@zennya.com -c user.name="zennya-deploy" commit -m "${PR_TITLE}"
+            git push zennya-infra "${BRANCH}"
+          fi
+
+          # Open the PR via the API (the auto-merge armer labels/merges it).
+          PR_HEAD="$(gh api -X POST repos/zennya-dev/zennya-infra/pulls \
+            -H "Authorization: token ${ZENNYA_INFRA_TOKEN}" \
+            -f title="${PR_TITLE}" -f head="${BRANCH}" -f base="${PR_TARGET_BRANCH}" -f body="${PR_BODY}" \
+            | jq -r .number)"
+          echo "PR_NUMBER=${PR_HEAD}" >> "$GITHUB_ENV"
+          echo "Auto-merge armed on PR #${PR_HEAD} (merge=${RC_MERGE} squash=${RC_SQUASH})"
+
+      # ZO-64093 — sync cluster-physician-directory after pin PR auto-merges. Blocks the deploy
+      # job until Argo reaches Synced+Healthy (max 10m). Uses curl +
+      # the runner pod auto-mounted ServiceAccount bearer token; no
+      # new RBAC, no new secrets, no new binary (ZO-60536 fix).
+      - name: "ZO-64093: sync cluster-physician-directory and wait Synced+Healthy"
+        run: |
+          set -euo pipefail
+          # ZO-79387: the Argo in-cluster serving cert does not cover
+          # .svc.cluster.local SANs, so --cacert fails with curl exit 60
+          # ("no alternative certificate subject name"). The endpoint is
+          # internal-only; -k is the standard in-cluster automation posture.
+          ARGOCD_URL="https://argocd-server.argocd.svc.cluster.local:443"
+          APP=cluster-physician-directory
+          SA_DIR="/var/run/secrets/kubernetes.io/serviceaccount"
+          TOKEN="$(cat "$SA_DIR/token")"
+          # ZO-79387: Argo CD has no POST /api/v1/applications/{app}/refresh
+          # route (server/application/application.proto, master). The
+          # documented refresh trigger is GET with ?refresh=normal
+          # (ApplicationQuery.refresh). Earlier attempts POSTed here and
+          # got 415 ("Unsupported Media Type"); GET cannot 415 on content
+          # negotiation.
+          curl --fail --silent --show-error --max-time 60 --insecure \
+            --header "Authorization: Bearer $TOKEN" \
+            "$ARGOCD_URL/api/v1/applications/$APP?refresh=normal" \
+            -o /dev/null -w "  refresh HTTP %{http_code}\n"
+          curl --fail --silent --show-error --max-time 600 --insecure \
+            --header "Authorization: Bearer $TOKEN" \
+            --header "Content-Type: application/json" \
+            --request POST "$ARGOCD_URL/api/v1/applications/$APP/sync" \
+            -d '{"prune":false,"retry":{"limit":5,"duration":"10m"}}' \
+            -o /dev/null -w "  sync   HTTP %{http_code}\n"
+          DEADLINE=$(( $(date +%s) + 600 ))
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            STATUS=$(curl --fail --silent --show-error --max-time 30 --insecure \
+                      --header "Authorization: Bearer $TOKEN" \
+                      "$ARGOCD_URL/api/v1/applications/$APP?fields=status" || true)
+            HEALTH=$(echo "$STATUS" | jq -r '.status.health.status // "Unknown"' 2>/dev/null || echo "Unknown")
+            SYNC=$(echo "$STATUS" | jq -r '.status.sync.status // "Unknown"' 2>/dev/null || echo "Unknown")
+            echo "  Argo $APP: health=$HEALTH sync=$SYNC"
+            if [ "$HEALTH" = "Healthy" ] && [ "$SYNC" = "Synced" ]; then
+              echo "### Argo $APP: Synced + Healthy" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$HEALTH" = "Degraded" ]; then
+              echo "::error::Argo $APP reports health=Degraded after pin merge."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::Argo $APP did not reach Synced+Healthy within 10m (last: health=$HEALTH sync=$SYNC)."
+          exit 1
